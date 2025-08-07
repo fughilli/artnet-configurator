@@ -11,14 +11,25 @@ import struct
 import argparse
 import time
 import ipaddress
+import enum
 from typing import List, Optional
+
+class ChannelConfig(enum.Enum):
+    """Channel configuration values."""
+    CHANNEL_CONFIG_RGB = 0x00
+    CHANNEL_CONFIG_RBG = 0x08
+    CHANNEL_CONFIG_GRB = 0x10
+    CHANNEL_CONFIG_GBR = 0x18
+    CHANNEL_CONFIG_BRG = 0x20
+    CHANNEL_CONFIG_BGR = 0x28
 
 class ArtNetConfigurator:
     """ArtNet device configurator using reverse-engineered protocol."""
     
-    def __init__(self, bind_ip: str = "0.0.0.0", bind_port: int = 6454):
+    def __init__(self, bind_ip: str = "0.0.0.0", bind_port: int = 6454, num_ports: int = 12):
         self.bind_ip = bind_ip
         self.bind_port = bind_port
+        self.num_ports = num_ports
         self.socket = None
         
     def start(self):
@@ -124,7 +135,7 @@ class ArtNetConfigurator:
             print(f"Error parsing ArtPollReply: {e}")
             return None
             
-    def set_ip_address(self, new_ip: str):
+    def set_config(self, new_ip: str, channel_config: ChannelConfig, universes_per_port: int):
         """Set IP address on a target device."""
         try:
             # Validate IP addresses
@@ -136,7 +147,7 @@ class ArtNetConfigurator:
         print(f"Setting IP address to {new_ip}...")
         
         # Create IP configuration packet based on packet diff analysis
-        config_packet = self._create_ip_config_packet(new_ip)
+        config_packet = self._create_config_packet(new_ip, channel_config, universes_per_port)
         
         # Send as broadcast (ArtNet configuration packets are broadcast)
         self.socket.sendto(config_packet, ('255.255.255.255', 6454))
@@ -166,7 +177,7 @@ class ArtNetConfigurator:
         
         return True
         
-    def _create_ip_config_packet(self, ip: str) -> bytes:
+    def _create_config_packet(self, ip: str, channel_config: ChannelConfig, universes_per_port: int) -> bytes:
         """Create IP configuration packet based on reverse-engineered protocol."""
         # Parse IP address
         ip_parts = [int(x) for x in ip.split('.')]
@@ -183,13 +194,16 @@ class ArtNetConfigurator:
         # Configuration data (bytes 16+) - using observed pattern from PCAP
         # This is the standard configuration data observed in successful IP config packets
         packet += b'\x06'
-        packet += b'\x00\x00\x06\x00\x01\x00\x00\x00\x00\x00\x00\x00\x01\x06\x00\x07'
-        packet += b'\x06\x00\x0d\x06\x00\x13\x06\x00\x19\x06\x00\x1f\x06\x00\x25\x06'
-        packet += b'\x00\x2b\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-        packet += b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-        packet += b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-        packet += b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-        packet += b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+        packet += struct.pack('<B', channel_config.value)
+        packet += b'\x00'
+        packet += struct.pack('<B', universes_per_port)
+        packet += b'\x00\x01\x00\x00\x00\x00\x00\x00'
+        universe_offset = 1
+        for i in range(self.num_ports):
+            packet += struct.pack('<BBB', 0, universe_offset, universes_per_port)
+            universe_offset += universes_per_port
+
+        packet += b'\x00' * (128 - len(packet))
         
         return packet
         
@@ -207,6 +221,11 @@ class ArtNetConfigurator:
         
         return '\n'.join(result)
 
+CHANNEL_CONFIG_MAP = {
+    name.replace('CHANNEL_CONFIG_', '').lower(): member
+    for name, member in ChannelConfig.__members__.items()
+}
+
 def main():
     """Main function for the configuration utility."""
     parser = argparse.ArgumentParser(description='ArtNet Device Configuration Utility')
@@ -222,6 +241,13 @@ def main():
     # Configure command
     config_parser = subparsers.add_parser('configure', help='Configure ArtNet devices')
     config_parser.add_argument('--set-ip', help='Set IP address (format: x.x.x.x)')
+    config_parser.add_argument(
+        '--channel-config',
+        type=lambda x: CHANNEL_CONFIG_MAP[x.lower()],
+        default='rgb',
+        help='Channel configuration (choices: {})'.format(', '.join(CHANNEL_CONFIG_MAP.keys()))
+    )
+    config_parser.add_argument('--universes-per-port', type=int, default=1, help='Universes per port')
     config_parser.add_argument('--debug', action='store_true', help='Show packet hex dump for debugging')
     
     args = parser.parse_args()
@@ -248,22 +274,18 @@ def main():
                 print("No devices found.")
                 
         elif args.command == 'configure':
-            if args.set_ip:
-                # Create config packet for debugging if requested
-                if args.debug:
-                    config_packet = configurator._create_ip_config_packet(args.set_ip)
-                    print("Configuration packet hex dump:")
-                    print(configurator._hex_dump(config_packet))
-                    print()
-                
-                success = configurator.set_ip_address(args.set_ip)
-                if success:
-                    print("Configuration completed successfully.")
-                    print("Note: Device may need to restart to apply new IP address.")
-                else:
-                    print("Configuration failed.")
+            # Create config packet for debugging if requested
+            if args.debug:
+                config_packet = configurator._create_config_packet(args.set_ip, args.channel_config, args.universes_per_port)
+                print("Configuration packet hex dump:")
+                print(configurator._hex_dump(config_packet))
+                print()
+            
+            success = configurator.set_config(args.set_ip, args.channel_config, args.universes_per_port)
+            if success:
+                print("Configuration completed successfully.")
             else:
-                print("Error: --set-ip is required for configure command.")
+                print("Configuration failed.")
                 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
