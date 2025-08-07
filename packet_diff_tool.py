@@ -131,6 +131,10 @@ class PacketDiffTool:
         self.diff_text.tag_configure("header", background="lightblue", foreground="black", font=('Courier', 10, 'bold'))
         self.diff_text.tag_configure("file_header", background="lightyellow", foreground="black", font=('Courier', 10, 'bold'))
         
+        # Darker highlight colors for specific octet changes
+        self.diff_text.tag_configure("added_highlight", background="darkgreen", foreground="white")
+        self.diff_text.tag_configure("removed_highlight", background="darkred", foreground="white")
+        
     def add_pcap_file(self):
         """Add a PCAP file to the analysis."""
         filename = filedialog.askopenfilename(
@@ -304,7 +308,7 @@ class PacketDiffTool:
         self.display_diff(baseline_packet, compare_packet)
         
     def display_diff(self, baseline_packet, compare_packet):
-        """Display a diff between two packets."""
+        """Display a diff between two packets with highlighted octet changes."""
         self.diff_text.delete(1.0, tk.END)
         
         # Add file headers
@@ -314,10 +318,15 @@ class PacketDiffTool:
         self.diff_text.insert(tk.END, f"Baseline: [{baseline_file}] Packet {baseline_packet['index']} ({baseline_packet['source']} -> {baseline_packet['destination']})\n", "file_header")
         self.diff_text.insert(tk.END, f"Compare:  [{compare_file}] Packet {compare_packet['index']} ({compare_packet['source']} -> {compare_packet['destination']})\n\n", "file_header")
         
+        # Find specific byte differences
+        baseline_data = baseline_packet['payload']
+        compare_data = compare_packet['payload']
+        byte_differences = self.find_byte_differences(baseline_data, compare_data)
+        
         baseline_hex = self.hex_dump(baseline_packet['payload'])
         compare_hex = self.hex_dump(compare_packet['payload'])
         
-        # Create diff
+        # Create diff with highlighted changes
         baseline_lines = baseline_hex.split('\n')
         compare_lines = compare_hex.split('\n')
         
@@ -328,10 +337,11 @@ class PacketDiffTool:
                 for line in baseline_lines[i1:i2]:
                     self.diff_text.insert(tk.END, f"  {line}\n", "unchanged")
             elif tag == 'replace':
+                # Handle replaced lines with byte-level highlighting
                 for line in baseline_lines[i1:i2]:
-                    self.diff_text.insert(tk.END, f"- {line}\n", "removed")
+                    self.insert_highlighted_line(f"- {line}\n", line, byte_differences, is_removed=True)
                 for line in compare_lines[j1:j2]:
-                    self.diff_text.insert(tk.END, f"+ {line}\n", "added")
+                    self.insert_highlighted_line(f"+ {line}\n", line, byte_differences, is_removed=False)
             elif tag == 'delete':
                 for line in baseline_lines[i1:i2]:
                     self.diff_text.insert(tk.END, f"- {line}\n", "removed")
@@ -352,6 +362,155 @@ class PacketDiffTool:
             result.append(f'{i:04x}: {hex_part:<{length*3}} |{ascii_part}|')
         
         return '\n'.join(result)
+        
+    def find_byte_differences(self, baseline_data: bytes, compare_data: bytes) -> List[Tuple[int, int, int]]:
+        """Find specific byte differences between two data arrays.
+        Returns list of (offset, old_value, new_value) tuples."""
+        differences = []
+        min_len = min(len(baseline_data), len(compare_data))
+        
+        for i in range(min_len):
+            if baseline_data[i] != compare_data[i]:
+                differences.append((i, baseline_data[i], compare_data[i]))
+                
+        return differences
+        
+    def highlight_byte_changes(self, hex_line: str, byte_differences: List[Tuple[int, int, int]], is_removed: bool) -> str:
+        """Highlight specific byte changes in a hex dump line.
+        Returns the line with special markers for highlighting."""
+        if not byte_differences:
+            return hex_line
+            
+        # Parse the hex line to find the offset
+        # Format: "0000: 41 72 74 2d 4e 65 74 00 fd 00 74 02 00 63 3c 06 |Art-Net..t..c<.|"
+        try:
+            parts = hex_line.split(':')
+            if len(parts) != 2:
+                return hex_line
+                
+            offset_str = parts[0].strip()
+            hex_part = parts[1].split('|')[0].strip()
+            
+            # Parse offset
+            line_offset = int(offset_str, 16)
+            
+            # Split hex bytes
+            hex_bytes = hex_part.split()
+            
+            # Check if any differences fall within this line
+            line_highlights = []
+            for diff_offset, old_val, new_val in byte_differences:
+                if line_offset <= diff_offset < line_offset + len(hex_bytes):
+                    byte_index = diff_offset - line_offset
+                    if byte_index < len(hex_bytes):
+                        # Mark this byte for highlighting
+                        line_highlights.append((byte_index, old_val, new_val))
+            
+            if line_highlights:
+                # Create highlighted version
+                highlighted_bytes = []
+                for i, hex_byte in enumerate(hex_bytes):
+                    # Check if this byte should be highlighted
+                    highlight_info = None
+                    for byte_idx, old_val, new_val in line_highlights:
+                        if byte_idx == i:
+                            highlight_info = (old_val, new_val)
+                            break
+                    
+                    if highlight_info:
+                        # Add highlight marker
+                        if is_removed:
+                            highlighted_bytes.append(f"[[{hex_byte}]]")  # Dark red for removed
+                        else:
+                            highlighted_bytes.append(f"[[{hex_byte}]]")  # Dark green for added
+                    else:
+                        highlighted_bytes.append(hex_byte)
+                
+                # Reconstruct the line
+                highlighted_hex = ' '.join(highlighted_bytes)
+                return f"{offset_str}: {highlighted_hex:<{len(hex_part)}} |{parts[1].split('|')[1] if '|' in parts[1] else ''}|"
+            
+        except (ValueError, IndexError):
+            pass
+            
+        return hex_line
+        
+    def insert_highlighted_line(self, prefix: str, hex_line: str, byte_differences: List[Tuple[int, int, int]], is_removed: bool):
+        """Insert a hex line with byte-level highlighting applied."""
+        if not byte_differences:
+            # No differences, insert normally
+            tag = "removed" if is_removed else "added"
+            self.diff_text.insert(tk.END, prefix, tag)
+            return
+            
+        # Parse the hex line to find the offset
+        try:
+            parts = hex_line.split(':')
+            if len(parts) != 2:
+                # Can't parse, insert normally
+                tag = "removed" if is_removed else "added"
+                self.diff_text.insert(tk.END, prefix, tag)
+                return
+                
+            offset_str = parts[0].strip()
+            hex_part = parts[1].split('|')[0].strip()
+            
+            # Parse offset
+            line_offset = int(offset_str, 16)
+            
+            # Split hex bytes
+            hex_bytes = hex_part.split()
+            
+            # Check if any differences fall within this line
+            line_highlights = []
+            for diff_offset, old_val, new_val in byte_differences:
+                if line_offset <= diff_offset < line_offset + len(hex_bytes):
+                    byte_index = diff_offset - line_offset
+                    if byte_index < len(hex_bytes):
+                        # Mark this byte for highlighting
+                        line_highlights.append((byte_index, old_val, new_val))
+            
+            if line_highlights:
+                # Insert with highlighting
+                self.diff_text.insert(tk.END, prefix[:2])  # "- " or "+ "
+                
+                # Insert offset
+                tag = "removed" if is_removed else "added"
+                self.diff_text.insert(tk.END, f"{offset_str}: ", tag)
+                
+                # Insert hex bytes with highlighting
+                for i, hex_byte in enumerate(hex_bytes):
+                    # Check if this byte should be highlighted
+                    should_highlight = False
+                    for byte_idx, old_val, new_val in line_highlights:
+                        if byte_idx == i:
+                            should_highlight = True
+                            break
+                    
+                    if should_highlight:
+                        # Apply darker highlighting
+                        highlight_tag = "removed_highlight" if is_removed else "added_highlight"
+                        self.diff_text.insert(tk.END, hex_byte, highlight_tag)
+                    else:
+                        # Apply normal highlighting
+                        self.diff_text.insert(tk.END, hex_byte, tag)
+                    
+                    # Add space between bytes
+                    if i < len(hex_bytes) - 1:
+                        self.diff_text.insert(tk.END, " ", tag)
+                
+                # Insert ASCII part with proper spacing (two spaces before |)
+                ascii_part = parts[1].split('|')[1] if '|' in parts[1] else ''
+                self.diff_text.insert(tk.END, f"  |{ascii_part}|\n", tag)
+            else:
+                # No highlights on this line, insert normally
+                tag = "removed" if is_removed else "added"
+                self.diff_text.insert(tk.END, prefix, tag)
+                
+        except (ValueError, IndexError):
+            # Can't parse, insert normally
+            tag = "removed" if is_removed else "added"
+            self.diff_text.insert(tk.END, prefix, tag)
 
 def main():
     root = tk.Tk()
