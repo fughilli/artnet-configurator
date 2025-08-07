@@ -124,25 +124,46 @@ class ArtNetConfigurator:
             print(f"Error parsing ArtPollReply: {e}")
             return None
             
-    def set_ip_address(self, target_ip: str, new_ip: str):
+    def set_ip_address(self, new_ip: str):
         """Set IP address on a target device."""
         try:
             # Validate IP addresses
-            ipaddress.ip_address(target_ip)
             ipaddress.ip_address(new_ip)
         except ValueError as e:
             print(f"Invalid IP address: {e}")
             return False
             
-        print(f"Setting IP address on {target_ip} to {new_ip}...")
+        print(f"Setting IP address to {new_ip}...")
         
-        # Create IP configuration packet
+        # Create IP configuration packet based on packet diff analysis
         config_packet = self._create_ip_config_packet(new_ip)
         
-        # Send to target device
-        self.socket.sendto(config_packet, (target_ip, 6454))
+        # Send as broadcast (ArtNet configuration packets are broadcast)
+        self.socket.sendto(config_packet, ('255.255.255.255', 6454))
         
-        print(f"IP configuration packet sent to {target_ip}")
+        print(f"IP configuration packet broadcast to network")
+        
+        # Wait a moment for the device to process the configuration
+        time.sleep(1)
+        
+        # Verify the change by polling for the device at the new IP
+        print(f"Verifying configuration by polling {new_ip}...")
+        self.socket.sendto(self._create_artpoll_packet(), (new_ip, 6454))
+        
+        # Listen for response from the new IP
+        try:
+            self.socket.settimeout(3.0)
+            data, addr = self.socket.recvfrom(1024)
+            if self._is_artpoll_reply(data) and addr[0] == new_ip:
+                print(f"✅ Success! Device now responds at {new_ip}")
+                return True
+            else:
+                print(f"⚠️  Device may not have updated to {new_ip}")
+                return False
+        except socket.timeout:
+            print(f"⚠️  No response from {new_ip} - device may not have updated")
+            return False
+        
         return True
         
     def _create_ip_config_packet(self, ip: str) -> bytes:
@@ -150,25 +171,18 @@ class ArtNetConfigurator:
         # Parse IP address
         ip_parts = [int(x) for x in ip.split('.')]
         
-        # Create packet based on observed pattern from PCAP analysis
-        packet = b'Art-Net\x00'  # ID
-        packet += struct.pack('<H', 0xfd00)  # OpCode (ArtAddress)
-        packet += struct.pack('<H', 0x0000)  # Protocol version
+        # Create packet based on packet diff analysis findings
+        packet = b'Art-Net\x00'  # ID (8 bytes)
+        packet += struct.pack('>H', 0xfd00)  # OpCode (ArtAddress) - bytes 8-9
+        packet += struct.pack('<B', 0x74)    # Protocol version
         
-        # Based on the PCAP analysis, the IP address appears to be encoded
-        # in a specific pattern. Let me create the packet structure:
+        # IP address assignment at bytes 11-14 (direct byte representation, not little-endian)
+        # Based on packet diff analysis: 02 00 63 3c = 2.0.99.60
+        packet += struct.pack('<BBBB', ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3])
         
-        # Protocol version and command type (observed pattern)
-        packet += struct.pack('<H', 0x7402)  # Protocol version + command type
-        
-        # IP address in the observed format (based on PCAP analysis)
-        # The pattern shows: 02 00 63 32 for 2.0.99.50
-        # and: 02 00 63 33 for 2.0.99.51
-        # This suggests the IP is encoded as: [second_octet] [first_octet] [third_octet] [fourth_octet]
-        packet += struct.pack('<BBBB', ip_parts[1], ip_parts[0], ip_parts[2], ip_parts[3])
-        
-        # Additional configuration data (based on observed packets)
-        packet += b'\x06'  # Command type (observed)
+        # Configuration data (bytes 16+) - using observed pattern from PCAP
+        # This is the standard configuration data observed in successful IP config packets
+        packet += b'\x06'
         packet += b'\x00\x00\x06\x00\x01\x00\x00\x00\x00\x00\x00\x00\x01\x06\x00\x07'
         packet += b'\x06\x00\x0d\x06\x00\x13\x06\x00\x19\x06\x00\x1f\x06\x00\x25\x06'
         packet += b'\x00\x2b\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
@@ -176,9 +190,22 @@ class ArtNetConfigurator:
         packet += b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
         packet += b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
         packet += b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-        packet += b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
         
         return packet
+        
+    def _hex_dump(self, data: bytes, length: int = 16) -> str:
+        """Create a hex dump of binary data for debugging."""
+        if not data:
+            return ""
+        
+        result = []
+        for i in range(0, len(data), length):
+            chunk = data[i:i + length]
+            hex_part = ' '.join(f'{b:02x}' for b in chunk)
+            ascii_part = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in chunk)
+            result.append(f'{i:04x}: {hex_part:<{length*3}} |{ascii_part}|')
+        
+        return '\n'.join(result)
 
 def main():
     """Main function for the configuration utility."""
@@ -195,7 +222,7 @@ def main():
     # Configure command
     config_parser = subparsers.add_parser('configure', help='Configure ArtNet devices')
     config_parser.add_argument('--set-ip', help='Set IP address (format: x.x.x.x)')
-    config_parser.add_argument('--target', help='Target device IP address')
+    config_parser.add_argument('--debug', action='store_true', help='Show packet hex dump for debugging')
     
     args = parser.parse_args()
     
@@ -221,15 +248,22 @@ def main():
                 print("No devices found.")
                 
         elif args.command == 'configure':
-            if args.set_ip and args.target:
-                success = configurator.set_ip_address(args.target, args.set_ip)
+            if args.set_ip:
+                # Create config packet for debugging if requested
+                if args.debug:
+                    config_packet = configurator._create_ip_config_packet(args.set_ip)
+                    print("Configuration packet hex dump:")
+                    print(configurator._hex_dump(config_packet))
+                    print()
+                
+                success = configurator.set_ip_address(args.set_ip)
                 if success:
                     print("Configuration completed successfully.")
                     print("Note: Device may need to restart to apply new IP address.")
                 else:
                     print("Configuration failed.")
             else:
-                print("Error: --set-ip and --target are required for configure command.")
+                print("Error: --set-ip is required for configure command.")
                 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
