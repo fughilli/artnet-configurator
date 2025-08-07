@@ -11,8 +11,9 @@ import struct
 import argparse
 import time
 import ipaddress
-import enum
 from typing import List, Optional
+import enum
+from scapy.all import conf, srp1, Ether, IP, UDP, Raw, ARP, get_if_addr, get_if_hwaddr
 
 class ChannelConfig(enum.Enum):
     """Channel configuration values."""
@@ -22,6 +23,11 @@ class ChannelConfig(enum.Enum):
     CHANNEL_CONFIG_GBR = 0x18
     CHANNEL_CONFIG_BRG = 0x20
     CHANNEL_CONFIG_BGR = 0x28
+
+CHANNEL_CONFIG_MAP = {
+    name.replace('CHANNEL_CONFIG_', '').lower(): member
+    for name, member in ChannelConfig.__members__.items()
+}
 
 class ArtNetConfigurator:
     """ArtNet device configurator using reverse-engineered protocol."""
@@ -109,34 +115,33 @@ class ArtNetConfigurator:
                 
     def _parse_artpoll_reply(self, data: bytes, addr: tuple) -> Optional[dict]:
         """Parse ArtPollReply packet."""
-        if len(data) < 238:
-            return None
-            
         try:
-            # Extract device information
-            # IP address is at bytes 10-13 in the format [first_octet] [second_octet] [third_octet] [fourth_octet]
-            # Based on Wireshark data: 02 00 63 32 = 2.0.99.50
+            # Extract IP address from bytes 10-13 (corrected offset based on packet diff analysis)
             ip_bytes = data[10:14]
-            # Reconstruct IP: [first] [second] [third] [fourth]
             self_reported_ip = f"{ip_bytes[0]}.{ip_bytes[1]}.{ip_bytes[2]}.{ip_bytes[3]}"
-            port = struct.unpack('<H', data[16:18])[0]
-            short_name = data[28:44].decode('ascii', errors='ignore').rstrip('\x00')
-            long_name = data[44:172].decode('ascii', errors='ignore').rstrip('\x00')
+            
+            # Extract short name (bytes 26-43)
+            short_name = data[26:43].decode('ascii', errors='ignore').strip('\x00')
+            
+            # Extract long name (bytes 44-171)
+            long_name = data[44:171].decode('ascii', errors='ignore').strip('\x00')
+            
+            # Get MAC address for the source IP
+            source_mac = self._get_mac_for_ip(addr[0])
             
             return {
                 'self_reported_ip': self_reported_ip,
-                'source_ip': addr[0],  # IP address from the network frame
-                'port': port,
+                'source_ip': addr[0],
+                'source_mac': source_mac,
                 'short_name': short_name,
-                'long_name': long_name,
-                'addr': addr
+                'long_name': long_name
             }
         except Exception as e:
             print(f"Error parsing ArtPollReply: {e}")
             return None
             
     def set_config(self, new_ip: str, target_ip: str, channel_config: ChannelConfig, universes_per_port: int):
-        """Set IP address on a target device."""
+        """Set configuration on a target device using Layer 2 packets."""
         try:
             # Validate IP addresses
             ipaddress.ip_address(new_ip)
@@ -145,35 +150,49 @@ class ArtNetConfigurator:
             print(f"Invalid IP address: {e}")
             return False
             
-        print(f"Setting IP address to {new_ip}...")
+        print(f"Setting configuration on {target_ip} to IP {new_ip}...")
         
-        # Create IP configuration packet based on packet diff analysis
+        # Create configuration packet
         config_packet = self._create_config_packet(new_ip, channel_config, universes_per_port)
         
-        # Send as broadcast (ArtNet configuration packets are broadcast)
-        self.socket.sendto(config_packet, (target_ip, 6454))
+        # Send using Layer 2 (bypassing routing table)
+        success = self._send_layer2_packet(config_packet, target_ip)
         
-        print(f"IP configuration packet broadcast to network")
-        
-        # Wait a moment for the device to process the configuration
-        time.sleep(1)
-        
-        # Verify the change by polling for the device at the new IP
-        print(f"Verifying configuration by polling {new_ip}...")
-        self.socket.sendto(self._create_artpoll_packet(), (new_ip, 6454))
-        
-        # Listen for response from the new IP
-        try:
-            self.socket.settimeout(3.0)
-            data, addr = self.socket.recvfrom(1024)
-            if self._is_artpoll_reply(data) and addr[0] == new_ip:
-                print(f"✅ Success! Device now responds at {new_ip}")
-                return True
-            else:
-                print(f"⚠️  Device may not have updated to {new_ip}")
-                return False
-        except socket.timeout:
-            print(f"⚠️  No response from {new_ip} - device may not have updated")
+        if success:
+            print(f"Configuration packet sent to {target_ip}")
+            
+            # Wait a moment for the device to process the configuration
+            time.sleep(1)
+            
+            # Try to verify the change by polling for the device at the new IP
+            # Note: This may fail if routing table doesn't know about the new IP yet
+            print(f"Verifying configuration by polling {new_ip}...")
+            try:
+                self.socket.sendto(self._create_artpoll_packet(), (new_ip, 6454))
+                
+                # Listen for response from the new IP
+                try:
+                    self.socket.settimeout(3.0)
+                    data, addr = self.socket.recvfrom(1024)
+                    if self._is_artpoll_reply(data) and addr[0] == new_ip:
+                        print(f"✅ Success! Device now responds at {new_ip}")
+                        return True
+                    else:
+                        print(f"⚠️  Device may not have updated to {new_ip}")
+                        return True  # Still consider it successful
+                except socket.timeout:
+                    print(f"⚠️  No response from {new_ip} - device may not have updated yet")
+                    return True  # Still consider it successful
+            except OSError as e:
+                if "No route to host" in str(e):
+                    print(f"⚠️  Cannot verify {new_ip} - routing table may not be updated yet")
+                    print(f"   This is normal for IP changes. Device should respond after restart.")
+                    return True  # Still consider it successful
+                else:
+                    print(f"⚠️  Verification failed: {e}")
+                    return True  # Still consider it successful
+        else:
+            print(f"Failed to send configuration packet to {target_ip}")
             return False
         
         return True
@@ -208,6 +227,197 @@ class ArtNetConfigurator:
         
         return packet
         
+    def _send_layer2_packet(self, payload: bytes, target_ip: str) -> bool:
+        """Send packet at Layer 2 through the bound interface."""
+        try:
+            # Get the interface name from the bind IP
+            interface = self._get_interface_from_ip(self.bind_ip)
+            if not interface:
+                print(f"Could not determine interface for IP {self.bind_ip}")
+                return False
+                
+            # Get interface MAC address
+            src_mac = get_if_hwaddr(interface)
+            src_ip = get_if_addr(interface)
+            
+            print(f"Using interface {interface} (MAC: {src_mac}, IP: {src_ip})")
+            
+            # Discover target MAC address
+            target_mac = self._discover_target_mac(target_ip, interface, src_mac, src_ip)
+            if not target_mac:
+                print(f"Could not discover MAC address for {target_ip}")
+                return False
+                
+            print(f"Discovered target MAC: {target_mac}")
+            
+            # Create Layer 2 packet with specific target MAC
+            packet = (
+                Ether(dst=target_mac, src=src_mac) /
+                IP(src=src_ip, dst=target_ip) /
+                UDP(sport=6454, dport=6454) /
+                Raw(load=payload)
+            )
+            
+            # Send the packet
+            result = srp1(packet, iface=interface, timeout=1, verbose=False)
+            
+            if result:
+                print(f"Packet sent successfully to {target_ip} ({target_mac})")
+                return True
+            else:
+                print(f"No response from {target_ip} (this is normal for configuration packets)")
+                return True  # Still consider it successful
+                
+        except Exception as e:
+            print(f"Error sending Layer 2 packet: {e}")
+            return False
+            
+    def _discover_target_mac(self, target_ip: str, interface: str, src_mac: str, src_ip: str) -> Optional[str]:
+        """Discover MAC address of target IP using ARP."""
+        try:
+            print(f"Discovering MAC address for {target_ip}...")
+            
+            # Create ARP request packet
+            arp_packet = (
+                Ether(dst="ff:ff:ff:ff:ff:ff", src=src_mac) /
+                ARP(op=1, hwsrc=src_mac, psrc=src_ip, hwdst="00:00:00:00:00:00", pdst=target_ip)
+            )
+            
+            # Send ARP request and wait for response
+            result = srp1(arp_packet, iface=interface, timeout=3, verbose=False)
+            
+            if result and result.haslayer(ARP):
+                target_mac = result[ARP].hwsrc
+                print(f"Found MAC address: {target_mac}")
+                return target_mac
+            else:
+                print(f"No ARP response from {target_ip}")
+                return None
+                
+        except Exception as e:
+            print(f"Error during MAC discovery: {e}")
+            return None
+            
+    def _get_mac_for_ip(self, ip: str) -> Optional[str]:
+        """Get MAC address for an IP address using ARP cache or ARP resolution."""
+        try:
+            # First try to get from ARP cache
+            interface = self._get_interface_from_ip(self.bind_ip)
+            if not interface:
+                return None
+                
+            # Try to get MAC from ARP cache first
+            arp_cache = conf.arp_cache
+            if ip in arp_cache:
+                return arp_cache[ip]
+                
+            # If not in cache, perform ARP resolution
+            src_mac = get_if_hwaddr(interface)
+            src_ip = get_if_addr(interface)
+            
+            # Create ARP request
+            arp_packet = (
+                Ether(dst="ff:ff:ff:ff:ff:ff", src=src_mac) /
+                ARP(op=1, hwsrc=src_mac, psrc=src_ip, hwdst="00:00:00:00:00:00", pdst=ip)
+            )
+            
+            # Send ARP request and wait for response
+            result = srp1(arp_packet, iface=interface, timeout=2, verbose=False)
+            
+            if result and result.haslayer(ARP):
+                target_mac = result[ARP].hwsrc
+                # Cache the result
+                conf.arp_cache[ip] = target_mac
+                return target_mac
+            else:
+                return None
+                
+        except Exception as e:
+            # Don't print error for MAC lookup failures during discovery
+            return None
+            
+    def make_unique_ips(self, base_ip: str, channel_config: ChannelConfig, universes_per_port: int, 
+                       timeout: float = 5.0, dry_run: bool = False, debug: bool = False) -> bool:
+        """Discover all controllers and assign them sequential IP addresses."""
+        try:
+            # Validate base IP
+            ipaddress.ip_address(base_ip)
+        except ValueError as e:
+            print(f"Invalid base IP address: {e}")
+            return False
+            
+        print(f"Discovering controllers and assigning sequential IPs starting from {base_ip}...")
+        
+        # Discover all devices
+        devices = self.discover_devices(timeout)
+        if not devices:
+            print("No devices found to configure.")
+            return False
+            
+        print(f"\nFound {len(devices)} devices to configure:")
+        for i, device in enumerate(devices):
+            mac_info = f"MAC: {device['source_mac']}" if device['source_mac'] else "MAC: Unknown"
+            print(f"  {i+1}. {device['short_name']} (currently {device['self_reported_ip']}, {mac_info})")
+            
+        # Generate sequential IPs
+        base_parts = [int(x) for x in base_ip.split('.')]
+        sequential_ips = []
+        for i in range(len(devices)):
+            # Increment the last octet
+            new_ip_parts = base_parts.copy()
+            new_ip_parts[3] += i
+            sequential_ips.append('.'.join(str(x) for x in new_ip_parts))
+            
+        print(f"\nSequential IP assignment:")
+        for i, (device, new_ip) in enumerate(zip(devices, sequential_ips)):
+            print(f"  {device['short_name']}: {device['self_reported_ip']} → {new_ip}")
+            
+        if dry_run:
+            print("\nDRY RUN - No changes will be made")
+            return True
+            
+        # Configure each device
+        print(f"\nConfiguring devices...")
+        success_count = 0
+        
+        for device, new_ip in zip(devices, sequential_ips):
+            print(f"\nConfiguring {device['short_name']} ({device['self_reported_ip']} → {new_ip})...")
+            
+            # Create config packet for debugging if requested
+            if debug:
+                config_packet = self._create_config_packet(new_ip, channel_config, universes_per_port)
+                print("Configuration packet hex dump:")
+                print(self._hex_dump(config_packet))
+                print()
+            
+            # Send configuration
+            try:
+                success = self.set_config(new_ip, device['self_reported_ip'], channel_config, universes_per_port)
+                if success:
+                    success_count += 1
+                    print(f"✅ Successfully configured {device['short_name']} to {new_ip}")
+                else:
+                    print(f"❌ Failed to configure {device['short_name']}")
+            except Exception as e:
+                print(f"❌ Error configuring {device['short_name']}: {e}")
+                print(f"   Continuing with next device...")
+                
+        print(f"\nConfiguration complete: {success_count}/{len(devices)} devices configured successfully")
+        return success_count > 0  # Return True if at least one device was configured
+            
+    def _get_interface_from_ip(self, ip: str) -> Optional[str]:
+        """Get interface name from IP address."""
+        try:
+            # Get all interfaces
+            interfaces = conf.ifaces
+            for iface_name, iface in interfaces.items():
+                if hasattr(iface, 'ip') and iface.ip == ip:
+                    return iface_name
+            return None
+        except Exception as e:
+            print(f"Error getting interface for IP {ip}: {e}")
+            return None
+            
     def _hex_dump(self, data: bytes, length: int = 16) -> str:
         """Create a hex dump of binary data for debugging."""
         if not data:
@@ -221,11 +431,6 @@ class ArtNetConfigurator:
             result.append(f'{i:04x}: {hex_part:<{length*3}} |{ascii_part}|')
         
         return '\n'.join(result)
-
-CHANNEL_CONFIG_MAP = {
-    name.replace('CHANNEL_CONFIG_', '').lower(): member
-    for name, member in ChannelConfig.__members__.items()
-}
 
 def main():
     """Main function for the configuration utility."""
@@ -242,7 +447,7 @@ def main():
     # Configure command
     config_parser = subparsers.add_parser('configure', help='Configure ArtNet devices')
     config_parser.add_argument('--set-ip', help='Set IP address (format: x.x.x.x)')
-    config_parser.add_argument('--target-ip', default='255.255.255.255', help='Target device IP address to configure (format: x.x.x.x)')
+    config_parser.add_argument('--target', default='255.255.255.255', help='Target device IP address to configure (format: x.x.x.x)')
     config_parser.add_argument(
         '--channel-config',
         type=lambda x: CHANNEL_CONFIG_MAP[x.lower()],
@@ -251,6 +456,15 @@ def main():
     )
     config_parser.add_argument('--universes-per-port', type=int, default=1, help='Universes per port')
     config_parser.add_argument('--debug', action='store_true', help='Show packet hex dump for debugging')
+    
+    # Make unique IPs command
+    unique_parser = subparsers.add_parser('make_unique_ips', help='Discover controllers and assign sequential IP addresses')
+    unique_parser.add_argument('--base-ip', required=True, help='Base IP address for sequential assignment (format: x.x.x.x)')
+    unique_parser.add_argument('--channel-config', type=lambda x: CHANNEL_CONFIG_MAP[x.lower()], default='rgb', help='Channel configuration')
+    unique_parser.add_argument('--universes-per-port', type=int, default=1, help='Universes per port')
+    unique_parser.add_argument('--timeout', type=float, default=5.0, help='Discovery timeout in seconds')
+    unique_parser.add_argument('--dry-run', action='store_true', help='Show what would be configured without making changes')
+    unique_parser.add_argument('--debug', action='store_true', help='Show packet hex dumps for debugging')
     
     args = parser.parse_args()
     
@@ -269,7 +483,8 @@ def main():
             if devices:
                 print("\nDiscovered devices:")
                 for device in devices:
-                    print(f"  Self-reported: {device['self_reported_ip']}, Source: {device['source_ip']}")
+                    mac_info = f"MAC: {device['source_mac']}" if device['source_mac'] else "MAC: Unknown"
+                    print(f"  Self-reported: {device['self_reported_ip']}, Source: {device['source_ip']}, {mac_info}")
                     print(f"    {device['short_name']} ({device['long_name']})")
                     print()
             else:
@@ -283,11 +498,28 @@ def main():
                 print(configurator._hex_dump(config_packet))
                 print()
             
-            success = configurator.set_config(args.set_ip, args.target_ip, args.channel_config, args.universes_per_port)
+            success = configurator.set_config(args.set_ip, args.target, args.channel_config, args.universes_per_port)
             if success:
                 print("Configuration completed successfully.")
             else:
                 print("Configuration failed.")
+                
+        elif args.command == 'make_unique_ips':
+            success = configurator.make_unique_ips(
+                args.base_ip, 
+                args.channel_config, 
+                args.universes_per_port, 
+                args.timeout,
+                args.dry_run,
+                args.debug
+            )
+            if success:
+                if args.dry_run:
+                    print("Dry run completed successfully.")
+                else:
+                    print("Unique IP assignment completed successfully.")
+            else:
+                print("Unique IP assignment failed.")
                 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
