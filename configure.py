@@ -135,11 +135,12 @@ class ArtNetConfigurator:
             print(f"Error parsing ArtPollReply: {e}")
             return None
             
-    def set_config(self, new_ip: str, channel_config: ChannelConfig, universes_per_port: int):
+    def set_config(self, new_ip: str, target_ip: str, channel_config: ChannelConfig, universes_per_port: int):
         """Set IP address on a target device."""
         try:
             # Validate IP addresses
             ipaddress.ip_address(new_ip)
+            ipaddress.ip_address(target_ip)
         except ValueError as e:
             print(f"Invalid IP address: {e}")
             return False
@@ -150,7 +151,7 @@ class ArtNetConfigurator:
         config_packet = self._create_config_packet(new_ip, channel_config, universes_per_port)
         
         # Send as broadcast (ArtNet configuration packets are broadcast)
-        self.socket.sendto(config_packet, ('255.255.255.255', 6454))
+        self.socket.sendto(config_packet, (target_ip, 6454))
         
         print(f"IP configuration packet broadcast to network")
         
@@ -241,6 +242,7 @@ def main():
     # Configure command
     config_parser = subparsers.add_parser('configure', help='Configure ArtNet devices')
     config_parser.add_argument('--set-ip', help='Set IP address (format: x.x.x.x)')
+    config_parser.add_argument('--target-ip', default='255.255.255.255', help='Target device IP address to configure (format: x.x.x.x)')
     config_parser.add_argument(
         '--channel-config',
         type=lambda x: CHANNEL_CONFIG_MAP[x.lower()],
@@ -281,7 +283,7 @@ def main():
                 print(configurator._hex_dump(config_packet))
                 print()
             
-            success = configurator.set_config(args.set_ip, args.channel_config, args.universes_per_port)
+            success = configurator.set_config(args.set_ip, args.target_ip, args.channel_config, args.universes_per_port)
             if success:
                 print("Configuration completed successfully.")
             else:
