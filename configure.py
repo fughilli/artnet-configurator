@@ -62,7 +62,7 @@ class ArtNetConfigurator:
         if self.socket:
             self.socket.close()
             
-    def discover_devices(self, timeout: float = 5.0) -> List[dict]:
+    def discover_devices(self, timeout: float = 1.0) -> List[dict]:
         """Discover ArtNet devices on the network."""
         print("Discovering ArtNet devices...")
         
@@ -172,7 +172,7 @@ class ArtNetConfigurator:
                 
                 # Listen for response from the new IP
                 try:
-                    self.socket.settimeout(3.0)
+                    self.socket.settimeout(1.0)
                     data, addr = self.socket.recvfrom(1024)
                     if self._is_artpoll_reply(data) and addr[0] == new_ip:
                         print(f"✅ Success! Device now responds at {new_ip}")
@@ -284,7 +284,7 @@ class ArtNetConfigurator:
             )
             
             # Send ARP request and wait for response
-            result = srp1(arp_packet, iface=interface, timeout=3, verbose=False)
+            result = srp1(arp_packet, iface=interface, timeout=1, verbose=False)
             
             if result and result.haslayer(ARP):
                 target_mac = result[ARP].hwsrc
@@ -299,19 +299,14 @@ class ArtNetConfigurator:
             return None
             
     def _get_mac_for_ip(self, ip: str) -> Optional[str]:
-        """Get MAC address for an IP address using ARP cache or ARP resolution."""
+        """Get MAC address for an IP address using ARP resolution."""
         try:
-            # First try to get from ARP cache
+            # Get interface
             interface = self._get_interface_from_ip(self.bind_ip)
             if not interface:
                 return None
                 
-            # Try to get MAC from ARP cache first
-            arp_cache = conf.arp_cache
-            if ip in arp_cache:
-                return arp_cache[ip]
-                
-            # If not in cache, perform ARP resolution
+            # Perform ARP resolution
             src_mac = get_if_hwaddr(interface)
             src_ip = get_if_addr(interface)
             
@@ -322,22 +317,19 @@ class ArtNetConfigurator:
             )
             
             # Send ARP request and wait for response
-            result = srp1(arp_packet, iface=interface, timeout=2, verbose=False)
+            result = srp1(arp_packet, iface=interface, timeout=1, verbose=False)
             
             if result and result.haslayer(ARP):
                 target_mac = result[ARP].hwsrc
-                # Cache the result
-                conf.arp_cache[ip] = target_mac
                 return target_mac
             else:
                 return None
                 
         except Exception as e:
-            # Don't print error for MAC lookup failures during discovery
             return None
             
-    def make_unique_ips(self, base_ip: str, channel_config: ChannelConfig, universes_per_port: int, 
-                       timeout: float = 5.0, dry_run: bool = False, debug: bool = False) -> bool:
+    def configure_sequential(self, base_ip: str, channel_config: ChannelConfig, universes_per_port: int, 
+                           timeout: float = 1.0, dry_run: bool = False, debug: bool = False, save_config: str = None) -> bool:
         """Discover all controllers and assign them sequential IP addresses."""
         try:
             # Validate base IP
@@ -372,6 +364,35 @@ class ArtNetConfigurator:
         for i, (device, new_ip) in enumerate(zip(devices, sequential_ips)):
             print(f"  {device['short_name']}: {device['self_reported_ip']} → {new_ip}")
             
+        # Save configuration to JSON if requested
+        if save_config:
+            config_data = {
+                'devices': [
+                    {
+                        'mac': device['source_mac'],
+                        'current_ip': device['self_reported_ip'],
+                        'new_ip': new_ip,
+                        'name': device['short_name'],
+                        'description': device['long_name']
+                    }
+                    for device, new_ip in zip(devices, sequential_ips)
+                ],
+                'settings': {
+                    'channel_config': channel_config.name,
+                    'universes_per_port': universes_per_port,
+                    'base_ip': base_ip
+                },
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+            }
+            
+            try:
+                import json
+                with open(save_config, 'w') as f:
+                    json.dump(config_data, f, indent=2)
+                print(f"\nConfiguration saved to {save_config}")
+            except Exception as e:
+                print(f"Warning: Could not save configuration to {save_config}: {e}")
+            
         if dry_run:
             print("\nDRY RUN - No changes will be made")
             return True
@@ -404,15 +425,135 @@ class ArtNetConfigurator:
                 
         print(f"\nConfiguration complete: {success_count}/{len(devices)} devices configured successfully")
         return success_count > 0  # Return True if at least one device was configured
+        
+    def configure_from_file(self, config_file: str, channel_config: ChannelConfig, universes_per_port: int, 
+                          dry_run: bool = False, debug: bool = False) -> bool:
+        """Configure devices from JSON configuration file."""
+        try:
+            import json
+            with open(config_file, 'r') as f:
+                config_data = json.load(f)
+        except Exception as e:
+            print(f"Error loading configuration file {config_file}: {e}")
+            return False
+            
+        if 'devices' not in config_data:
+            print(f"Error: Invalid configuration file format - missing 'devices' section")
+            return False
+            
+        devices_config = config_data['devices']
+        print(f"Loaded configuration for {len(devices_config)} devices from {config_file}")
+        
+        # Use settings from config file if available, otherwise use command-line arguments
+        settings = config_data.get('settings', {})
+        
+        # Channel config: use config file if specified, otherwise command-line argument
+        config_channel_config = settings.get('channel_config')
+        if config_channel_config:
+            try:
+                # Convert string to enum
+                channel_config = CHANNEL_CONFIG_MAP[config_channel_config.lower()]
+                print(f"Using channel config from file: {config_channel_config}")
+            except KeyError:
+                print(f"Warning: Invalid channel config '{config_channel_config}' in file, using command-line argument: {channel_config.name}")
+        else:
+            print(f"Using channel config from command line: {channel_config.name}")
+            
+        # Universes per port: use config file if specified, otherwise command-line argument
+        config_universes_per_port = settings.get('universes_per_port')
+        if config_universes_per_port is not None:
+            universes_per_port = config_universes_per_port
+            print(f"Using universes per port from file: {universes_per_port}")
+        else:
+            print(f"Using universes per port from command line: {universes_per_port}")
+        
+        if dry_run:
+            print("\nDRY RUN - Configuration that would be applied:")
+            for device_config in devices_config:
+                print(f"  {device_config.get('name', 'Unknown')}: {device_config.get('current_ip', 'Unknown')} → {device_config.get('new_ip', 'Unknown')}")
+            return True
+            
+        # Configure each device
+        print(f"\nConfiguring devices from file...")
+        success_count = 0
+        
+        for device_config in devices_config:
+            current_ip = device_config.get('current_ip')
+            new_ip = device_config.get('new_ip')
+            device_name = device_config.get('name', 'Unknown')
+            
+            if not current_ip or not new_ip:
+                print(f"Warning: Skipping device {device_name} - missing IP information")
+                continue
+                
+            print(f"\nConfiguring {device_name} ({current_ip} → {new_ip})...")
+            
+            # Create config packet for debugging if requested
+            if debug:
+                config_packet = self._create_config_packet(new_ip, channel_config, universes_per_port)
+                print("Configuration packet hex dump:")
+                print(self._hex_dump(config_packet))
+                print()
+            
+            # Send configuration
+            try:
+                success = self.set_config(new_ip, current_ip, channel_config, universes_per_port)
+                if success:
+                    success_count += 1
+                    print(f"✅ Successfully configured {device_name} to {new_ip}")
+                else:
+                    print(f"❌ Failed to configure {device_name}")
+            except Exception as e:
+                print(f"❌ Error configuring {device_name}: {e}")
+                print(f"   Continuing with next device...")
+                
+        print(f"\nConfiguration complete: {success_count}/{len(devices_config)} devices configured successfully")
+        return success_count > 0
+        
+    def save_discovery_config(self, devices: List[dict], filename: str):
+        """Save discovered devices to JSON configuration file."""
+        config_data = {
+            'devices': [
+                {
+                    'mac': device['source_mac'],
+                    'current_ip': device['self_reported_ip'],
+                    'new_ip': device['self_reported_ip'],  # Keep current IP as default
+                    'name': device['short_name'],
+                    'description': device['long_name']
+                }
+                for device in devices
+            ],
+            'settings': {
+                'channel_config': 'rgb',  # Default values
+                'universes_per_port': 1
+            },
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'discovery_info': {
+                'total_devices': len(devices),
+                'source': 'discovery'
+            }
+        }
+        
+        try:
+            import json
+            with open(filename, 'w') as f:
+                json.dump(config_data, f, indent=2)
+            print(f"\nDiscovery configuration saved to {filename}")
+            print(f"You can edit this file to set new IP addresses, then use:")
+            print(f"  python3 configure.py configure from_config --config={filename}")
+        except Exception as e:
+            print(f"Error saving discovery configuration to {filename}: {e}")
             
     def _get_interface_from_ip(self, ip: str) -> Optional[str]:
         """Get interface name from IP address."""
         try:
             # Get all interfaces
             interfaces = conf.ifaces
+            
             for iface_name, iface in interfaces.items():
                 if hasattr(iface, 'ip') and iface.ip == ip:
                     return iface_name
+                    
             return None
         except Exception as e:
             print(f"Error getting interface for IP {ip}: {e}")
@@ -442,12 +583,11 @@ def main():
     
     # Discover command
     discover_parser = subparsers.add_parser('discover', help='Discover ArtNet devices')
-    discover_parser.add_argument('--timeout', type=float, default=5.0, help='Discovery timeout in seconds')
+    discover_parser.add_argument('--timeout', type=float, default=1.0, help='Discovery timeout in seconds')
+    discover_parser.add_argument('--save-config', help='Save discovered devices to JSON configuration file')
     
-    # Configure command
+    # Configure command with sub-subcommands
     config_parser = subparsers.add_parser('configure', help='Configure ArtNet devices')
-    config_parser.add_argument('--set-ip', help='Set IP address (format: x.x.x.x)')
-    config_parser.add_argument('--target', default='255.255.255.255', help='Target device IP address to configure (format: x.x.x.x)')
     config_parser.add_argument(
         '--channel-config',
         type=lambda x: CHANNEL_CONFIG_MAP[x.lower()],
@@ -457,14 +597,25 @@ def main():
     config_parser.add_argument('--universes-per-port', type=int, default=1, help='Universes per port')
     config_parser.add_argument('--debug', action='store_true', help='Show packet hex dump for debugging')
     
-    # Make unique IPs command
-    unique_parser = subparsers.add_parser('make_unique_ips', help='Discover controllers and assign sequential IP addresses')
-    unique_parser.add_argument('--base-ip', required=True, help='Base IP address for sequential assignment (format: x.x.x.x)')
-    unique_parser.add_argument('--channel-config', type=lambda x: CHANNEL_CONFIG_MAP[x.lower()], default='rgb', help='Channel configuration')
-    unique_parser.add_argument('--universes-per-port', type=int, default=1, help='Universes per port')
-    unique_parser.add_argument('--timeout', type=float, default=5.0, help='Discovery timeout in seconds')
-    unique_parser.add_argument('--dry-run', action='store_true', help='Show what would be configured without making changes')
-    unique_parser.add_argument('--debug', action='store_true', help='Show packet hex dumps for debugging')
+    # Configure sub-subcommands
+    config_subparsers = config_parser.add_subparsers(dest='config_command', help='Configuration commands')
+    
+    # Single device configuration
+    single_parser = config_subparsers.add_parser('single', help='Configure a single device')
+    single_parser.add_argument('--set-ip', required=True, help='New IP address (format: x.x.x.x)')
+    single_parser.add_argument('--target', required=True, help='Target device IP address (format: x.x.x.x)')
+    
+    # Sequential IP assignment
+    sequential_parser = config_subparsers.add_parser('sequential', help='Discover and assign sequential IP addresses')
+    sequential_parser.add_argument('--base-ip', required=True, help='Base IP address for sequential assignment (format: x.x.x.x)')
+    sequential_parser.add_argument('--timeout', type=float, default=1.0, help='Discovery timeout in seconds')
+    sequential_parser.add_argument('--dry-run', action='store_true', help='Show what would be configured without making changes')
+    sequential_parser.add_argument('--save-config', help='Save MAC→IP mapping to JSON file')
+    
+    # Configuration from file
+    from_config_parser = config_subparsers.add_parser('from_config', help='Configure devices from JSON configuration file')
+    from_config_parser.add_argument('--config', required=True, help='JSON configuration file path')
+    from_config_parser.add_argument('--dry-run', action='store_true', help='Show what would be configured without making changes')
     
     args = parser.parse_args()
     
@@ -487,39 +638,65 @@ def main():
                     print(f"  Self-reported: {device['self_reported_ip']}, Source: {device['source_ip']}, {mac_info}")
                     print(f"    {device['short_name']} ({device['long_name']})")
                     print()
+                    
+                # Save configuration if requested
+                if args.save_config:
+                    configurator.save_discovery_config(devices, args.save_config)
             else:
                 print("No devices found.")
                 
         elif args.command == 'configure':
-            # Create config packet for debugging if requested
-            if args.debug:
-                config_packet = configurator._create_config_packet(args.set_ip, args.channel_config, args.universes_per_port)
-                print("Configuration packet hex dump:")
-                print(configurator._hex_dump(config_packet))
-                print()
-            
-            success = configurator.set_config(args.set_ip, args.target, args.channel_config, args.universes_per_port)
-            if success:
-                print("Configuration completed successfully.")
-            else:
-                print("Configuration failed.")
+            if not args.config_command:
+                print("Error: Please specify a configuration command (single, sequential, or from_config)")
+                return
                 
-        elif args.command == 'make_unique_ips':
-            success = configurator.make_unique_ips(
-                args.base_ip, 
-                args.channel_config, 
-                args.universes_per_port, 
-                args.timeout,
-                args.dry_run,
-                args.debug
-            )
-            if success:
-                if args.dry_run:
-                    print("Dry run completed successfully.")
+            if args.config_command == 'single':
+                # Create config packet for debugging if requested
+                if args.debug:
+                    config_packet = configurator._create_config_packet(args.set_ip, args.channel_config, args.universes_per_port)
+                    print("Configuration packet hex dump:")
+                    print(configurator._hex_dump(config_packet))
+                    print()
+                
+                success = configurator.set_config(args.set_ip, args.target, args.channel_config, args.universes_per_port)
+                if success:
+                    print("Configuration completed successfully.")
                 else:
-                    print("Unique IP assignment completed successfully.")
-            else:
-                print("Unique IP assignment failed.")
+                    print("Configuration failed.")
+                    
+            elif args.config_command == 'sequential':
+                success = configurator.configure_sequential(
+                    args.base_ip, 
+                    args.channel_config, 
+                    args.universes_per_port, 
+                    args.timeout,
+                    args.dry_run,
+                    args.debug,
+                    args.save_config
+                )
+                if success:
+                    if args.dry_run:
+                        print("Dry run completed successfully.")
+                    else:
+                        print("Sequential IP assignment completed successfully.")
+                else:
+                    print("Sequential IP assignment failed.")
+                    
+            elif args.config_command == 'from_config':
+                success = configurator.configure_from_file(
+                    args.config,
+                    args.channel_config,
+                    args.universes_per_port,
+                    args.dry_run,
+                    args.debug
+                )
+                if success:
+                    if args.dry_run:
+                        print("Dry run completed successfully.")
+                    else:
+                        print("Configuration from file completed successfully.")
+                else:
+                    print("Configuration from file failed.")
                 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
