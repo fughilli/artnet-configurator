@@ -523,10 +523,6 @@ class ArtNetConfigurator:
                 }
                 for device in devices
             ],
-            'settings': {
-                'channel_config': 'rgb',  # Default values
-                'universes_per_port': 1
-            },
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
             'discovery_info': {
                 'total_devices': len(devices),
